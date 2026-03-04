@@ -406,48 +406,100 @@ export class ArizonaDHSScraper {
     if (!this.page) return null;
 
     try {
-      // Find and click Select button by facility name
-      const clicked = await this.page.evaluate((facilityName: string) => {
-        // Find the row containing this facility
-        const rows = Array.from(document.querySelectorAll('table tr'));
+      // Find the Select link for this facility using Puppeteer's native selectors
+      const selectLinks = await this.page.$$('table tr td:first-child a');
+      let targetLink: Awaited<ReturnType<typeof this.page.$$>>[0] | null = null;
 
-        for (const row of rows) {
-          const cells = row.querySelectorAll('td');
-          if (cells.length < 2) continue;
+      // Match by both name AND address for more precise matching
+      const nameToMatch = basicInfo.name.toUpperCase().trim();
+      const addressToMatch = basicInfo.address.substring(0, 20).toUpperCase().trim();
 
-          // Check if any cell contains the facility name (first 25 chars to handle variations)
-          const nameToMatch = facilityName.substring(0, 25).toUpperCase();
-          let foundInRow = false;
+      // First pass: try to find exact name match with address
+      for (const link of selectLinks) {
+        const linkText = await link.evaluate(el => el.textContent?.toLowerCase() || '');
+        if (!linkText.includes('select')) continue;
 
-          for (let i = 1; i < cells.length; i++) {
-            const cellText = (cells[i]?.textContent || '').toUpperCase().trim();
-            if (cellText.includes(nameToMatch) || nameToMatch.includes(cellText.substring(0, 20))) {
-              foundInRow = true;
-              break;
-            }
-          }
+        // Get the parent row and check for both name AND address
+        const rowInfo = await link.evaluate(el => {
+          const row = el.closest('tr');
+          const cells = row?.querySelectorAll('td');
+          const nameCell = cells?.[1]?.textContent?.toUpperCase().trim() || '';
+          const addressCell = cells?.[2]?.textContent?.toUpperCase().trim() || '';
+          return { name: nameCell, address: addressCell };
+        });
 
-          if (foundInRow) {
-            // Find clickable element in first cell
-            const firstCell = cells[0];
-            const clickable = firstCell?.querySelector('input, a, button') as HTMLElement;
-            if (clickable) {
-              clickable.click();
-              return true;
-            }
+        // Check for exact name match and partial address match
+        if (rowInfo.name === nameToMatch && rowInfo.address.includes(addressToMatch)) {
+          targetLink = link;
+          break;
+        }
+      }
+
+      // Second pass: try partial name match with address
+      if (!targetLink) {
+        const namePrefix = nameToMatch.substring(0, Math.min(30, nameToMatch.length));
+        for (const link of selectLinks) {
+          const linkText = await link.evaluate(el => el.textContent?.toLowerCase() || '');
+          if (!linkText.includes('select')) continue;
+
+          const rowInfo = await link.evaluate(el => {
+            const row = el.closest('tr');
+            const cells = row?.querySelectorAll('td');
+            const nameCell = cells?.[1]?.textContent?.toUpperCase().trim() || '';
+            const addressCell = cells?.[2]?.textContent?.toUpperCase().trim() || '';
+            return { name: nameCell, address: addressCell };
+          });
+
+          if (rowInfo.name.startsWith(namePrefix) && rowInfo.address.includes(addressToMatch)) {
+            targetLink = link;
+            break;
           }
         }
-        return false;
-      }, basicInfo.name);
+      }
 
-      if (!clicked) {
-        console.log(`        Could not click Select for: ${basicInfo.name.substring(0, 30)}`);
+      // Third pass: fall back to row index within visible Select links
+      if (!targetLink) {
+        let selectLinkIndex = 0;
+        for (const link of selectLinks) {
+          const linkText = await link.evaluate(el => el.textContent?.toLowerCase() || '');
+          if (linkText.includes('select')) {
+            if (selectLinkIndex === rowIndex) {
+              targetLink = link;
+              break;
+            }
+            selectLinkIndex++;
+          }
+        }
+      }
+
+      if (!targetLink) {
+        console.log(`        Could not find Select link for: ${basicInfo.name.substring(0, 30)}`);
         return null;
       }
 
-      // Wait for navigation
-      await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+      // Use Promise.all to wait for navigation while clicking
+      // This ensures we don't miss the navigation event
+      console.log(`        Clicking Select and waiting for navigation...`);
+      try {
+        await Promise.all([
+          this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+          targetLink.click()
+        ]);
+      } catch (navError) {
+        console.log(`        Navigation timeout, checking URL anyway...`);
+      }
+
       await this.delay(CONFIG.rateLimit.delayAfterSelect);
+
+      // Log current URL to debug navigation
+      const currentUrl = this.page.url();
+      console.log(`        Current URL: ${currentUrl.substring(0, 80)}...`);
+
+      // If we're still on SOD page, something went wrong
+      if (currentUrl.includes('hsapps.azdhs.gov/ls/sod')) {
+        console.log(`        Still on SOD page - navigation failed`);
+        return null;
+      }
 
       // Extract data from all three tabs
       const details = await this.extractFromAllTabs(basicInfo);
@@ -1309,76 +1361,59 @@ export class ArizonaDHSScraper {
   private async extractDetailsTab(): Promise<Partial<ScrapedFacility> | null> {
     if (!this.page) return null;
 
-    const rawData = await this.page.evaluate(() => {
-      const getText = (labels: string[]): string => {
-        for (const label of labels) {
-          // Search in table cells
-          const cells = Array.from(document.querySelectorAll('td, th'));
-          for (let i = 0; i < cells.length; i++) {
-            const cellText = cells[i]?.textContent?.toLowerCase().trim() || '';
-            if (cellText.includes(label.toLowerCase())) {
-              // Get next cell or sibling
-              const nextCell = cells[i + 1];
-              if (nextCell?.textContent?.trim()) {
-                return nextCell.textContent.trim();
-              }
-            }
-          }
+    // Get HTML content and parse with regex instead of page.evaluate()
+    // This avoids TypeScript compilation issues with __name helper
+    const html = await this.page.content();
 
-          // Search in label-value pairs
-          const labelElements = Array.from(document.querySelectorAll('label, strong, b, dt, .label'));
-          for (const el of labelElements) {
-            if (el.textContent?.toLowerCase().includes(label.toLowerCase())) {
-              const next = el.nextElementSibling || el.parentElement?.nextElementSibling;
-              if (next?.textContent?.trim()) {
-                return next.textContent.trim();
-              }
-            }
-          }
-
-          // Regex search in page content
-          const pattern = new RegExp(`${label}[:\\s]*([^\\n\\r]+)`, 'i');
-          const match = document.body.innerText.match(pattern);
-          if (match && match[1]?.trim()) {
-            return match[1].trim();
-          }
+    const getText = (labels: string[]): string => {
+      for (const label of labels) {
+        // Pattern 1: Table cell with label followed by value cell
+        // <td>Label</td><td>Value</td>
+        const tableCellPattern = new RegExp(
+          `<t[dh][^>]*>[^<]*${label}[^<]*</t[dh]>\\s*<t[dh][^>]*>([^<]+)</t[dh]>`,
+          'i'
+        );
+        let match = html.match(tableCellPattern);
+        if (match && match[1]?.trim()) {
+          return match[1].trim();
         }
-        return '';
-      };
 
-      return {
-        licenseNumber: getText(['license number', 'license #', 'license no', 'lic #', 'license']),
-        name: getText(['facility name', 'provider name', 'name']),
-        address: getText(['address', 'street address', 'street']),
-        city: getText(['city']),
-        zipCode: getText(['zip', 'zip code', 'postal']),
-        county: getText(['county']),
-        phone: getText(['phone', 'telephone', 'tel']),
-        administrator: getText(['administrator', 'manager', 'director']),
-        owner: getText(['owner', 'operator', 'proprietor']),
-        capacityStr: getText(['capacity', 'beds', 'licensed capacity', 'bed count']),
-        licenseStatus: getText(['status', 'license status']),
-        facilityType: getText(['type', 'facility type', 'license type', 'category']),
-        licenseIssueDateStr: getText(['issue date', 'license issue', 'issued']),
-        licenseExpiryDateStr: getText(['expiration', 'expiry', 'expires', 'exp date']),
-      };
-    });
+        // Pattern 2: Label element followed by value
+        // <label>Label</label><span>Value</span>
+        const labelPattern = new RegExp(
+          `<(?:label|strong|b|dt)[^>]*>[^<]*${label}[^<]*</(?:label|strong|b|dt)>\\s*<[^>]+>([^<]+)`,
+          'i'
+        );
+        match = html.match(labelPattern);
+        if (match && match[1]?.trim()) {
+          return match[1].trim();
+        }
+
+        // Pattern 3: Colon-separated label: value
+        const colonPattern = new RegExp(`${label}\\s*:\\s*([^<\\n\\r]+)`, 'i');
+        match = html.match(colonPattern);
+        if (match && match[1]?.trim()) {
+          return match[1].trim();
+        }
+      }
+      return '';
+    };
 
     return {
-      licenseNumber: rawData.licenseNumber,
-      name: rawData.name,
-      address: rawData.address,
-      city: rawData.city,
-      zipCode: rawData.zipCode,
-      county: rawData.county,
-      phone: rawData.phone,
-      administrator: rawData.administrator,
-      owner: rawData.owner,
-      capacity: parseInt(rawData.capacityStr) || 0,
-      licenseStatus: rawData.licenseStatus,
-      facilityType: rawData.facilityType,
-      licenseIssueDate: this.parseDate(rawData.licenseIssueDateStr),
-      licenseExpiryDate: this.parseDate(rawData.licenseExpiryDateStr),
+      licenseNumber: getText(['license number', 'license #', 'license no', 'lic #', 'license']),
+      name: getText(['facility name', 'provider name', 'name']),
+      address: getText(['address', 'street address', 'street']),
+      city: getText(['city']),
+      zipCode: getText(['zip', 'zip code', 'postal']),
+      county: getText(['county']),
+      phone: getText(['phone', 'telephone', 'tel']),
+      administrator: getText(['administrator', 'manager', 'director']),
+      owner: getText(['owner', 'operator', 'proprietor']),
+      capacity: parseInt(getText(['capacity', 'beds', 'licensed capacity', 'bed count'])) || 0,
+      licenseStatus: getText(['status', 'license status']),
+      facilityType: getText(['type', 'facility type', 'license type', 'category']),
+      licenseIssueDate: this.parseDate(getText(['issue date', 'license issue', 'issued'])),
+      licenseExpiryDate: this.parseDate(getText(['expiration', 'expiry', 'expires', 'exp date'])),
     };
   }
 
@@ -1731,33 +1766,25 @@ export class ArizonaDHSScraper {
   }
 
   private async navigateToPage(pageNum: number): Promise<boolean> {
-    if (!this.page) return false;
+    if (!this.page || pageNum <= 1) return true; // Page 1 is default after navigation
 
     try {
-      // Look for page number links
-      const clicked = await this.page.evaluate((targetPage) => {
-        const links = Array.from(document.querySelectorAll('a'));
-        for (const link of links) {
-          const href = link.getAttribute('href') || '';
-          const text = link.textContent?.trim() || '';
+      // The SOD site uses image buttons for pagination (btnNext, btnPrevious, btnFirst, btnLast)
+      // There's no direct way to jump to a specific page, so we click Next repeatedly
+      let currentPage = 1;
 
-          // Check for page number in href or text
-          if (href.includes(`Page$${targetPage}`) || text === String(targetPage)) {
-            link.click();
-            return true;
-          }
+      while (currentPage < pageNum) {
+        const success = await this.navigateToNextPage();
+        if (!success) {
+          console.log(`        Could not navigate to page ${currentPage + 1}`);
+          return false;
         }
-        return false;
-      }, pageNum);
-
-      if (clicked) {
-        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-        await this.delay(1000);
-        return true;
+        currentPage++;
       }
 
-      return false;
+      return true;
     } catch (error) {
+      console.log(`        Error navigating to page ${pageNum}:`, error);
       return false;
     }
   }
@@ -1766,46 +1793,64 @@ export class ArizonaDHSScraper {
     if (!this.page) return false;
 
     try {
-      const clicked = await this.page.evaluate(() => {
-        // Look for next page elements
-        const nextSelectors = [
-          'input[type="image"][src*="next"]',
-          'input[type="image"][alt*="Next"]',
-          'a[href*="Page$Next"]',
-          'a:has-text("Next")',
-          'input[value="Next"]',
-          'button:has-text("Next")',
-        ];
+      // AZ DHS SOD uses image buttons for pagination:
+      // - ctl00_ContentPlaceHolder1_btnNext (Next)
+      // - ctl00_ContentPlaceHolder1_btnLast (Last)
+      // Disabled buttons have src containing "Disabled"
 
-        for (const selector of nextSelectors) {
-          const el = document.querySelector(selector) as HTMLElement;
-          if (el) {
-            el.click();
-            return true;
-          }
-        }
+      // First check if Next button exists and is not disabled
+      const nextButtonInfo = await this.page.evaluate(() => {
+        const nextBtn = document.querySelector('#ctl00_ContentPlaceHolder1_btnNext') as HTMLInputElement;
+        if (!nextBtn) return { exists: false };
 
-        // Also try finding ">" or ">>" links
-        const links = Array.from(document.querySelectorAll('a'));
-        for (const link of links) {
-          const text = link.textContent?.trim();
-          if (text === '>' || text === '>>' || text === 'Next') {
-            link.click();
-            return true;
-          }
-        }
+        const src = nextBtn.getAttribute('src') || '';
+        const isDisabled = src.toLowerCase().includes('disabled');
 
-        return false;
+        return {
+          exists: true,
+          src,
+          isDisabled,
+        };
       });
 
-      if (clicked) {
-        await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-        await this.delay(1000);
-        return true;
+      if (!nextButtonInfo.exists) {
+        console.log(`        No Next button found`);
+        return false;
       }
 
-      return false;
+      if (nextButtonInfo.isDisabled) {
+        console.log(`        Next button is disabled (last page)`);
+        return false;
+      }
+
+      // Click the Next button using Puppeteer's native click
+      const nextButton = await this.page.$('#ctl00_ContentPlaceHolder1_btnNext');
+      if (!nextButton) {
+        // Try alternate selector
+        const altButton = await this.page.$('input[name="ctl00$ContentPlaceHolder1$btnNext"]');
+        if (!altButton) {
+          console.log(`        Could not find Next button element`);
+          return false;
+        }
+
+        // Use Promise.all to wait for navigation while clicking
+        await Promise.all([
+          this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+          altButton.click()
+        ]);
+      } else {
+        // Use Promise.all to wait for navigation while clicking
+        await Promise.all([
+          this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }),
+          nextButton.click()
+        ]);
+      }
+
+      await this.delay(1000);
+      return true;
+
     } catch (error) {
+      console.log(`        Pagination error:`, error);
       return false;
     }
   }
