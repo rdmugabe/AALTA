@@ -484,7 +484,21 @@ export class ArizonaDHSScraper {
     const enforcements: ScrapedEnforcement[] = [];
 
     try {
-      // Look for tabs on the page
+      // Check if we're on the Salesforce Lightning page (azcarecheck.azdhs.gov)
+      const currentUrl = this.page.url();
+      const isSalesforcePage = currentUrl.includes('azcarecheck.azdhs.gov');
+
+      if (isSalesforcePage) {
+        console.log(`        On Salesforce page, waiting for dynamic content...`);
+
+        // Wait for Salesforce Lightning to fully load
+        await this.waitForSalesforceContent();
+
+        // Extract from Salesforce tabs
+        return await this.extractFromSalesforceTabs(basicInfo);
+      }
+
+      // Legacy tab handling for non-Salesforce pages
       const tabs = await this.findTabs();
       console.log(`        Found ${tabs.length} tabs: ${tabs.map(t => t.name).join(', ')}`);
 
@@ -547,6 +561,643 @@ export class ArizonaDHSScraper {
 
     } catch (error) {
       console.error('Error extracting from tabs:', error);
+      return null;
+    }
+  }
+
+  // Wait for Salesforce Lightning content to fully load
+  private async waitForSalesforceContent(): Promise<void> {
+    if (!this.page) return;
+
+    try {
+      // Wait longer for the Salesforce page to fully render
+      await this.delay(5000);
+
+      // The page.click method works even when querySelector doesn't find elements
+      // because Puppeteer uses a different mechanism to find clickable elements
+    } catch (error) {
+      console.log(`        Warning: Timeout waiting for Salesforce content`);
+    }
+  }
+
+  // Extract all data from Salesforce Lightning tabs
+  private async extractFromSalesforceTabs(basicInfo: { name: string; address: string; cityState: string; type: string }): Promise<FacilityDetails | null> {
+    if (!this.page) return null;
+
+    let facility: ScrapedFacility = {
+      licenseNumber: '',
+      name: basicInfo.name,
+      address: basicInfo.address,
+      city: this.parseCityFromCityState(basicInfo.cityState),
+      state: 'AZ',
+      zipCode: this.parseZipFromCityState(basicInfo.cityState),
+      county: '',
+      facilityType: basicInfo.type,
+      licenseStatus: 'ACTIVE',
+      capacity: 0,
+      specializations: [],
+      sourceUrl: this.page.url(),
+    };
+
+    const violations: ScrapedViolation[] = [];
+    const inspections: ScrapedInspection[] = [];
+    const enforcements: ScrapedEnforcement[] = [];
+
+    try {
+      // Extract Details from the current page HTML (Details tab is active by default)
+      console.log(`        Extracting Details tab...`);
+      let html = await this.page.content();
+      const detailData = this.extractDetailsFromHtml(html);
+      if (detailData) {
+        facility = { ...facility, ...detailData };
+      }
+
+      // Extract services
+      const services = this.extractServicesFromHtml(html);
+      if (services.length > 0) {
+        facility.specializations = services;
+      }
+
+      // Click Inspections tab and extract data
+      console.log(`        Clicking Inspections tab...`);
+      try {
+        await this.page.click('#Inspections__item');
+        await this.delay(2000);
+        html = await this.page.content();
+        const inspectionData = this.extractInspectionsFromHtml(html, facility.licenseNumber || `TEMP-${basicInfo.name}`);
+        inspections.push(...inspectionData);
+        console.log(`        Found ${inspectionData.length} inspections`);
+      } catch (e) {
+        console.log(`        Could not click Inspections tab`);
+      }
+
+      // Click Enforcements tab and extract data
+      console.log(`        Clicking Enforcements tab...`);
+      try {
+        await this.page.click('#enforcements__item');
+        await this.delay(2000);
+        html = await this.page.content();
+        const enforcementData = this.extractEnforcementsFromHtml(html, facility.licenseNumber || `TEMP-${basicInfo.name}`);
+        enforcements.push(...enforcementData.enforcements);
+        violations.push(...enforcementData.violations);
+        console.log(`        Found ${enforcementData.enforcements.length} enforcements, ${enforcementData.violations.length} violations`);
+      } catch (e) {
+        console.log(`        Could not click Enforcements tab`);
+      }
+
+      // Generate license number if not found
+      if (!facility.licenseNumber) {
+        facility.licenseNumber = `TEMP-${Buffer.from(`${basicInfo.name}-${basicInfo.address}`).toString('base64').slice(0, 12)}`;
+      }
+
+      // Update license numbers
+      violations.forEach(v => v.facilityLicenseNumber = facility.licenseNumber);
+      inspections.forEach(i => i.facilityLicenseNumber = facility.licenseNumber);
+      enforcements.forEach(e => e.facilityLicenseNumber = facility.licenseNumber);
+
+      return { facility, violations, inspections, enforcements };
+
+    } catch (error) {
+      console.error('Error extracting from Salesforce tabs:', error);
+      return null;
+    }
+  }
+
+  // Extract facility details from raw HTML using regex
+  private extractDetailsFromHtml(html: string): Partial<ScrapedFacility> | null {
+    const extractValue = (label: string): string => {
+      // Pattern: <p ...>Label</p>...value in next element
+      const patterns = [
+        // lightning-formatted-text
+        new RegExp(
+          `<p[^>]*>${label}</p>\\s*(?:<a[^>]*>)?\\s*<lightning-formatted-(?:text|phone)[^>]*>(?:<a[^>]*>)?([^<]+)`,
+          'i'
+        ),
+        // Direct text after link
+        new RegExp(
+          `<p[^>]*>${label}</p>\\s*<a[^>]*>[^<]*</a>`,
+          'i'
+        ),
+      ];
+
+      for (const pattern of patterns) {
+        const match = html.match(pattern);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+      return '';
+    };
+
+    const name = extractValue('Legal Name');
+    const address = extractValue('Address');
+    const phone = extractValue('Phone');
+    const licenseNumber = extractValue('License');
+    const licenseStatus = extractValue('License Status');
+    const facilityStatus = extractValue('Facility Status');
+    const facilityType = extractValue('Facility Type');
+    const owner = extractValue('Owner / Licensee');
+    const licenseEffective = extractValue('License Effective');
+    const administrator = extractValue('Chief Administrative Officer');
+
+    return {
+      name: name || undefined,
+      address: address || undefined,
+      phone: phone || undefined,
+      licenseNumber: licenseNumber || undefined,
+      licenseStatus: licenseStatus || undefined,
+      facilityType: facilityType || undefined,
+      owner: owner || undefined,
+      administrator: administrator || undefined,
+      licenseIssueDate: this.parseDate(licenseEffective),
+    };
+  }
+
+  // Extract services from raw HTML
+  private extractServicesFromHtml(html: string): string[] {
+    const services: string[] = [];
+    const serviceMatches = html.match(/<span class="service-type[^"]*">([^<]+)<\/span>/g);
+    if (serviceMatches) {
+      serviceMatches.forEach(m => {
+        const text = m.match(/>([^<]+)</)?.[1];
+        if (text) services.push(text);
+      });
+    }
+    return services;
+  }
+
+  // Extract inspections from raw HTML
+  private extractInspectionsFromHtml(html: string, licenseNumber: string): ScrapedInspection[] {
+    const inspections: ScrapedInspection[] = [];
+
+    // Look for data-cell-value attributes in the inspection table
+    // Pattern: data-cell-value="value"
+    const rows = html.match(/<tr[^>]*data-row-key-value="row-\d+"[^>]*>.*?<\/tr>/gs);
+
+    if (rows) {
+      for (const row of rows) {
+        const inspection: Partial<ScrapedInspection> = {};
+
+        // Extract inspection number (and link to details)
+        const inspNumberMatch = row.match(/data-col-key-value="portalLink[^"]*"[^>]*data-cell-value="([^"]+)"/);
+        const inspIdMatch = row.match(/inspectionId=([a-zA-Z0-9]+)/);
+
+        // Extract date
+        const dateMatch = row.match(/data-col-key-value="inspectionDates[^"]*"[^>]*data-cell-value="([^"]+)"/);
+
+        // Extract type
+        const typeMatch = row.match(/data-col-key-value="inspectionType[^"]*"[^>]*data-cell-value="([^"]+)"/);
+
+        // Extract status
+        const statusMatch = row.match(/data-col-key-value="inspectionStatus[^"]*"[^>]*data-cell-value="([^"]+)"/);
+
+        if (dateMatch) {
+          inspections.push({
+            facilityLicenseNumber: licenseNumber,
+            inspectionType: this.mapInspectionType(typeMatch?.[1] || 'Survey'),
+            inspectionDate: this.parseDate(dateMatch[1]) || new Date(),
+            overallResult: 'NO_DEFICIENCIES',
+            violationCount: 0,
+            reportUrl: inspIdMatch ? `https://azcarecheck.azdhs.gov/s/inspection-details?inspectionId=${inspIdMatch[1]}` : undefined,
+          });
+        }
+      }
+    }
+
+    return inspections;
+  }
+
+  // Extract enforcements from raw HTML
+  private extractEnforcementsFromHtml(html: string, licenseNumber: string): {
+    enforcements: ScrapedEnforcement[];
+    violations: ScrapedViolation[];
+  } {
+    const enforcements: ScrapedEnforcement[] = [];
+    const violations: ScrapedViolation[] = [];
+
+    // Check if there are no enforcements
+    if (html.includes('No enforcement') || html.includes('no record')) {
+      return { enforcements, violations };
+    }
+
+    // Look for enforcement data in tables
+    const rows = html.match(/<tr[^>]*data-row-key-value="row-\d+"[^>]*>.*?<\/tr>/gs);
+
+    if (rows) {
+      for (const row of rows) {
+        // Extract enforcement type
+        const typeMatch = row.match(/data-col-key-value="[^"]*type[^"]*"[^>]*data-cell-value="([^"]+)"/i);
+
+        // Extract date
+        const dateMatch = row.match(/data-col-key-value="[^"]*date[^"]*"[^>]*data-cell-value="([^"]+)"/i);
+
+        // Extract status
+        const statusMatch = row.match(/data-col-key-value="[^"]*status[^"]*"[^>]*data-cell-value="([^"]+)"/i);
+
+        // Extract description
+        const descMatch = row.match(/data-col-key-value="[^"]*description[^"]*"[^>]*data-cell-value="([^"]+)"/i);
+
+        if (typeMatch || dateMatch) {
+          const enfType = typeMatch?.[1]?.toLowerCase() || '';
+
+          if (enfType.includes('civil') || enfType.includes('penalty') ||
+              enfType.includes('revocation') || enfType.includes('suspension')) {
+            enforcements.push({
+              facilityLicenseNumber: licenseNumber,
+              enforcementType: typeMatch?.[1] || 'Citation',
+              effectiveDate: this.parseDate(dateMatch?.[1]) || new Date(),
+              description: descMatch?.[1] || '',
+              status: statusMatch?.[1] || 'ACTIVE',
+            });
+          } else {
+            // Treat as violation
+            violations.push({
+              facilityLicenseNumber: licenseNumber,
+              violationCode: `VIO-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+              category: 'QUALITY_OF_CARE',
+              description: descMatch?.[1] || typeMatch?.[1] || '',
+              severity: 'MODERATE',
+              citationDate: this.parseDate(dateMatch?.[1]) || new Date(),
+              status: 'CITED',
+            });
+          }
+        }
+      }
+    }
+
+    return { enforcements, violations };
+  }
+
+  // Click a Salesforce Lightning tab
+  private async clickSalesforceTab(tabValue: string): Promise<void> {
+    if (!this.page) return;
+
+    await this.page.evaluate((value) => {
+      const tab = document.querySelector(`lightning-tab-bar a[data-tab-value="${value}"]`) as HTMLElement;
+      if (tab) {
+        tab.click();
+      }
+    }, tabValue);
+
+    // Wait for tab content to show
+    await this.page.waitForFunction(
+      (value) => {
+        const tabPanel = document.querySelector(`lightning-tab[aria-labelledby="${value}__item"]`);
+        return tabPanel?.classList.contains('slds-show');
+      },
+      { timeout: 5000 },
+      tabValue
+    ).catch(() => {
+      // Fallback: just wait a bit
+    });
+  }
+
+  // Extract facility details from Salesforce Details tab
+  private async extractSalesforceDetailsTab(): Promise<Partial<ScrapedFacility> | null> {
+    if (!this.page) return null;
+
+    const data = await this.page.evaluate(() => {
+      // Helper to find text by preceding label
+      const findValue = (labelText: string): string => {
+        // Look for <p> elements with label text
+        const paragraphs = document.querySelectorAll('c-azcc-facility-details-tab p');
+        for (let i = 0; i < paragraphs.length; i++) {
+          const p = paragraphs[i] as HTMLElement;
+          if (p.textContent?.toLowerCase().includes(labelText.toLowerCase())) {
+            // Get the next sibling element which should have the value
+            const nextEl = p.nextElementSibling;
+            if (nextEl) {
+              return nextEl.textContent?.trim() || '';
+            }
+          }
+        }
+
+        // Alternative: look in lightning-formatted-text elements
+        const formattedTexts = Array.from(document.querySelectorAll('lightning-formatted-text'));
+        for (const el of formattedTexts) {
+          const parent = el.parentElement;
+          if (parent) {
+            const prevSibling = el.previousElementSibling;
+            if (prevSibling?.textContent?.toLowerCase().includes(labelText.toLowerCase())) {
+              return el.textContent?.trim() || '';
+            }
+          }
+        }
+
+        return '';
+      };
+
+      // Extract services from table
+      const services: string[] = [];
+      const serviceRows = document.querySelectorAll('c-azcc-facility-details-services-table tr td .service-type');
+      serviceRows.forEach(row => {
+        const text = row.textContent?.trim();
+        if (text) services.push(text);
+      });
+
+      return {
+        name: findValue('Legal Name') || findValue('Facility Name'),
+        address: findValue('Address'),
+        phone: findValue('Phone'),
+        administrator: findValue('Chief Administrative Officer') || findValue('Administrator'),
+        owner: findValue('Owner') || findValue('Licensee'),
+        licenseNumber: findValue('License'),
+        licenseStatus: findValue('License Status'),
+        facilityStatus: findValue('Facility Status'),
+        facilityType: findValue('Facility Type'),
+        licenseEffective: findValue('License Effective'),
+        closedDate: findValue('Closed Date'),
+        services,
+      };
+    });
+
+    return {
+      name: data.name || undefined,
+      address: data.address || undefined,
+      phone: data.phone || undefined,
+      administrator: data.administrator || undefined,
+      owner: data.owner || undefined,
+      licenseNumber: data.licenseNumber || undefined,
+      licenseStatus: data.licenseStatus || undefined,
+      facilityType: data.facilityType || undefined,
+      licenseIssueDate: this.parseDate(data.licenseEffective),
+      specializations: data.services,
+    };
+  }
+
+  // Extract inspections from Salesforce Inspections tab
+  private async extractSalesforceInspectionsTab(licenseNumber: string): Promise<ScrapedInspection[]> {
+    if (!this.page) return [];
+
+    const inspections: ScrapedInspection[] = [];
+
+    try {
+      const inspectionData = await this.page.evaluate(() => {
+        const results: Array<{
+          type: string;
+          date: string;
+          exitDate: string;
+          deficiencyCount: string;
+          attachmentUrl: string;
+        }> = [];
+
+        // Find all tables in the inspections tab
+        const activeTab = document.querySelector('lightning-tab.slds-show');
+        if (!activeTab) return results;
+
+        const tables = Array.from(activeTab.querySelectorAll('table'));
+        for (const table of tables) {
+          const rows = Array.from(table.querySelectorAll('tr'));
+          for (let i = 1; i < rows.length; i++) { // Skip header
+            const cells = rows[i].querySelectorAll('td');
+            if (cells.length < 2) continue;
+
+            // Look for PDF attachment link
+            let attachmentUrl = '';
+            const links = Array.from(rows[i].querySelectorAll('a'));
+            for (const link of links) {
+              const href = link.getAttribute('href') || '';
+              if (href.includes('.pdf') || href.includes('/sfc/') || href.includes('ContentDocument')) {
+                attachmentUrl = href;
+                break;
+              }
+            }
+
+            // Extract cell values (structure may vary)
+            const cellTexts = Array.from(cells).map((c: Element) => c.textContent?.trim() || '');
+
+            results.push({
+              type: cellTexts[0] || 'Survey',
+              date: cellTexts[1] || '',
+              exitDate: cellTexts[2] || '',
+              deficiencyCount: cellTexts[3] || '0',
+              attachmentUrl,
+            });
+          }
+        }
+
+        // If no table, look for list-style data
+        if (results.length === 0) {
+          const listItems = activeTab.querySelectorAll('.slds-item, .inspection-item, lightning-layout-item');
+          listItems.forEach(item => {
+            const text = item.textContent || '';
+            const dateMatch = text.match(/(\d{1,2}\/\d{1,2}\/\d{4})/);
+            if (dateMatch) {
+              results.push({
+                type: 'Survey',
+                date: dateMatch[1],
+                exitDate: '',
+                deficiencyCount: '0',
+                attachmentUrl: '',
+              });
+            }
+          });
+        }
+
+        return results;
+      });
+
+      console.log(`        Found ${inspectionData.length} inspections`);
+
+      for (const data of inspectionData) {
+        const inspection: ScrapedInspection = {
+          facilityLicenseNumber: licenseNumber,
+          inspectionType: this.mapInspectionType(data.type),
+          inspectionDate: this.parseDate(data.date) || new Date(),
+          exitDate: this.parseDate(data.exitDate),
+          overallResult: parseInt(data.deficiencyCount) > 0 ? 'DEFICIENCIES_CITED' : 'NO_DEFICIENCIES',
+          violationCount: parseInt(data.deficiencyCount) || 0,
+          reportUrl: data.attachmentUrl || undefined,
+        };
+
+        // Try to download PDF if available
+        if (data.attachmentUrl) {
+          try {
+            const pdfContent = await this.downloadSalesforcePDF(data.attachmentUrl);
+            if (pdfContent) {
+              inspection.reportContent = pdfContent;
+            }
+          } catch (pdfError) {
+            console.log(`        Could not download PDF`);
+          }
+        }
+
+        inspections.push(inspection);
+      }
+
+    } catch (error) {
+      console.error('Error extracting Salesforce inspections:', error);
+    }
+
+    return inspections;
+  }
+
+  // Extract enforcements from Salesforce Enforcements tab
+  private async extractSalesforceEnforcementsTab(licenseNumber: string): Promise<{
+    enforcements: ScrapedEnforcement[];
+    violations: ScrapedViolation[];
+  }> {
+    if (!this.page) return { enforcements: [], violations: [] };
+
+    const enforcements: ScrapedEnforcement[] = [];
+    const violations: ScrapedViolation[] = [];
+
+    try {
+      const enforcementData = await this.page.evaluate(() => {
+        const results: Array<{
+          type: string;
+          date: string;
+          description: string;
+          status: string;
+          citations: Array<{
+            code: string;
+            description: string;
+            date: string;
+          }>;
+        }> = [];
+
+        // Find the active/visible tab content
+        const activeTab = document.querySelector('lightning-tab.slds-show');
+        if (!activeTab) return results;
+
+        // Look for tables
+        const tables = Array.from(activeTab.querySelectorAll('table'));
+        for (const table of tables) {
+          const rows = Array.from(table.querySelectorAll('tr'));
+          for (let i = 1; i < rows.length; i++) {
+            const cells = rows[i].querySelectorAll('td');
+            if (cells.length < 2) continue;
+
+            const cellTexts = Array.from(cells).map((c: Element) => c.textContent?.trim() || '');
+
+            // Determine if this is an enforcement or citation row
+            const firstCell = cellTexts[0]?.toLowerCase() || '';
+            if (firstCell.includes('civil') || firstCell.includes('penalty') ||
+                firstCell.includes('revocation') || firstCell.includes('suspension')) {
+              results.push({
+                type: cellTexts[0],
+                date: cellTexts[1] || '',
+                description: cellTexts[2] || '',
+                status: cellTexts[3] || 'Active',
+                citations: [],
+              });
+            } else {
+              // Treat as citation/violation
+              const lastEntry = results.length > 0 ? results[results.length - 1] : null;
+              if (lastEntry) {
+                lastEntry.citations.push({
+                  code: cellTexts[0] || `VIO-${Date.now()}`,
+                  description: cellTexts[1] || '',
+                  date: cellTexts[2] || '',
+                });
+              } else {
+                results.push({
+                  type: 'Citation',
+                  date: '',
+                  description: '',
+                  status: '',
+                  citations: [{
+                    code: cellTexts[0] || `VIO-${Date.now()}`,
+                    description: cellTexts[1] || '',
+                    date: cellTexts[2] || '',
+                  }],
+                });
+              }
+            }
+          }
+        }
+
+        // Check for "No records" or similar messages
+        const pageText = activeTab.textContent?.toLowerCase() || '';
+        if (pageText.includes('no record') || pageText.includes('no enforcement') ||
+            pageText.includes('no data')) {
+          return [];
+        }
+
+        return results;
+      });
+
+      console.log(`        Found ${enforcementData.length} enforcement records`);
+
+      // Convert to our types
+      for (const data of enforcementData) {
+        if (data.type && data.type !== 'Citation') {
+          enforcements.push({
+            facilityLicenseNumber: licenseNumber,
+            enforcementType: data.type,
+            effectiveDate: this.parseDate(data.date) || new Date(),
+            description: data.description,
+            status: data.status || 'ACTIVE',
+          });
+        }
+
+        for (const citation of data.citations) {
+          if (citation.description || citation.code) {
+            violations.push({
+              facilityLicenseNumber: licenseNumber,
+              violationCode: citation.code || `VIO-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              category: 'QUALITY_OF_CARE',
+              description: citation.description,
+              severity: this.classifyViolationSeverity(citation.description),
+              citationDate: this.parseDate(citation.date) || new Date(),
+              status: 'CITED',
+            });
+          }
+        }
+      }
+
+    } catch (error) {
+      console.error('Error extracting Salesforce enforcements:', error);
+    }
+
+    return { enforcements, violations };
+  }
+
+  // Download PDF from Salesforce
+  private async downloadSalesforcePDF(url: string): Promise<string | null> {
+    if (!this.page || !url) return null;
+
+    try {
+      // Check cache
+      if (this.downloadedPDFs.has(url)) {
+        return this.downloadedPDFs.get(url) || null;
+      }
+
+      console.log(`        Downloading PDF: ${url.substring(0, 60)}...`);
+
+      // For Salesforce ContentDocument URLs, we need to handle them specially
+      let fullUrl = url;
+      if (!url.startsWith('http')) {
+        fullUrl = `https://azcarecheck.azdhs.gov${url}`;
+      }
+
+      // Download using page context
+      const pdfBuffer = await this.page.evaluate(async (pdfUrl) => {
+        try {
+          const response = await fetch(pdfUrl, { credentials: 'include' });
+          if (!response.ok) return null;
+          const buffer = await response.arrayBuffer();
+          return Array.from(new Uint8Array(buffer));
+        } catch {
+          return null;
+        }
+      }, fullUrl);
+
+      if (!pdfBuffer) return null;
+
+      // Parse PDF
+      const buffer = Buffer.from(pdfBuffer);
+      const pdfData = await pdfParse(buffer);
+      const content = pdfData.text;
+
+      // Cache result
+      this.downloadedPDFs.set(url, content);
+
+      console.log(`        Extracted ${content.length} characters from PDF`);
+      return content;
+
+    } catch (error) {
+      console.log(`        PDF download error:`, error);
       return null;
     }
   }
@@ -1046,7 +1697,21 @@ export class ArizonaDHSScraper {
     if (!this.page) return;
 
     try {
-      await this.page.goBack({ waitUntil: 'networkidle2', timeout: 30000 });
+      // Since clicking Select navigates to a different domain (azcarecheck.azdhs.gov),
+      // we can't use goBack reliably. Navigate directly back to the SOD search page.
+      const currentUrl = this.page.url();
+
+      if (currentUrl.includes('azcarecheck.azdhs.gov')) {
+        // We're on the Salesforce page, navigate directly to SOD search
+        await this.page.goto(
+          `${CONFIG.sodSearch.providerSearchUrl}?ProviderName=${letter}`,
+          { waitUntil: 'networkidle2', timeout: CONFIG.timeout }
+        );
+      } else {
+        // Try goBack first
+        await this.page.goBack({ waitUntil: 'networkidle2', timeout: 30000 });
+      }
+
       await this.delay(1000);
 
       // Check if we need to navigate to a specific page
