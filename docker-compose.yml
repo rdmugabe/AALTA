@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: aalta-postgres
+    environment:
+      POSTGRES_USER: aalta
+      POSTGRES_PASSWORD: aalta_dev_password
+      POSTGRES_DB: aalta
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U aalta -d aalta']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: aalta-redis
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Meilisearch
+  meilisearch:
+    image: getmeili/meilisearch:v1.6
+    container_name: aalta-meilisearch
+    environment:
+      MEILI_MASTER_KEY: aalta_meilisearch_dev_key
+      MEILI_ENV: development
+    ports:
+      - '7700:7700'
+    volumes:
+      - meilisearch_data:/meili_data
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:7700/health']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Server (development mode)
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: aalta-api
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgresql://aalta:aalta_dev_password@postgres:5432/aalta
+      REDIS_URL: redis://redis:6379
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_API_KEY: aalta_meilisearch_dev_key
+      PORT: 4000
+      CORS_ORIGIN: http://localhost:3001
+    ports:
+      - '4000:4000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+
+  # Web Server (for production-like local testing)
+  web:
+    build:
+      context: .
+      target: web
+    container_name: aalta-web
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    ports:
+      - '3001:3000'
+    depends_on:
+      - api
+    profiles:
+      - production
+
+volumes:
+  postgres_data:
+  redis_data:
+  meilisearch_data:
+
+networks:
+  default:
+    name: aalta-network

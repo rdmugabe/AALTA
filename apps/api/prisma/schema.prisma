@@ -1,0 +1,466 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============ FACILITY DOMAIN ============
+
+model Facility {
+  id                  String              @id @default(cuid())
+  licenseNumber       String              @unique
+  name                String
+  slug                String              @unique
+
+  // Location
+  address             String
+  city                String
+  state               String              @default("AZ")
+  zipCode             String
+  county              String
+  latitude            Decimal?            @db.Decimal(10, 8)
+  longitude           Decimal?            @db.Decimal(11, 8)
+
+  // Classification
+  facilityType        FacilityType
+  licenseStatus       LicenseStatus
+  capacity            Int
+  specializations     String[]
+
+  // Dates
+  licenseIssueDate    DateTime?
+  licenseExpiryDate   DateTime?
+  lastInspectionDate  DateTime?
+
+  // Computed Scores (denormalized for performance)
+  complianceScore     Decimal?            @db.Decimal(5, 2)
+  riskLevel           RiskLevel?
+  scoreUpdatedAt      DateTime?
+
+  // Relations
+  ownership           Ownership[]
+  violations          Violation[]
+  inspections         Inspection[]
+  complaints          Complaint[]
+  documents           Document[]
+  scoringHistory      ScoringHistory[]
+
+  // Metadata
+  dataSource          String
+  sourceUrl           String?
+  lastScrapedAt       DateTime
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  @@index([city, state])
+  @@index([complianceScore])
+  @@index([licenseStatus])
+  @@index([facilityType])
+  @@index([county])
+}
+
+enum FacilityType {
+  ASSISTED_LIVING
+  MEMORY_CARE
+  ADULT_FOSTER_CARE
+  BEHAVIORAL_HEALTH
+  CONTINUING_CARE
+}
+
+enum LicenseStatus {
+  ACTIVE
+  PROVISIONAL
+  SUSPENDED
+  REVOKED
+  EXPIRED
+  PENDING
+}
+
+enum RiskLevel {
+  LOW
+  MODERATE
+  HIGH
+  CRITICAL
+}
+
+// ============ OWNERSHIP TRACKING ============
+
+model Ownership {
+  id              String      @id @default(cuid())
+  facilityId      String
+  facility        Facility    @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  ownerName       String
+  ownerType       OwnerType
+  ownershipPct    Decimal?    @db.Decimal(5, 2)
+
+  // Corporate structure
+  parentCompany   String?
+  corporateChain  String[]
+
+  // Dates
+  effectiveDate   DateTime
+  endDate         DateTime?
+  isCurrent       Boolean     @default(true)
+
+  // Audit
+  sourceDocument  String?
+  createdAt       DateTime    @default(now())
+
+  @@index([facilityId, isCurrent])
+  @@index([ownerName])
+}
+
+enum OwnerType {
+  INDIVIDUAL
+  LLC
+  CORPORATION
+  NONPROFIT
+  GOVERNMENT
+  REIT
+  PRIVATE_EQUITY
+}
+
+// ============ VIOLATIONS ============
+
+model Violation {
+  id                  String          @id @default(cuid())
+  facilityId          String
+  facility            Facility        @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+  inspectionId        String?
+  inspection          Inspection?     @relation(fields: [inspectionId], references: [id])
+
+  // Violation details
+  violationCode       String
+  category            ViolationCategory
+  description         String          @db.Text
+  severity            ViolationSeverity
+
+  // Regulatory mapping
+  regulationCitation  String?
+  cfrReference        String?
+
+  // Status
+  citationDate        DateTime
+  correctionDueDate   DateTime?
+  correctionDate      DateTime?
+  status              ViolationStatus
+
+  // For repeated violations
+  isRepeat            Boolean         @default(false)
+  previousViolationId String?
+
+  // Scoring factors
+  severityScore       Decimal         @db.Decimal(5, 2)
+  weightedScore       Decimal?        @db.Decimal(5, 2)
+
+  // Source
+  sourceDocumentId    String?
+  sourceDocument      Document?       @relation(fields: [sourceDocumentId], references: [id])
+
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  @@index([facilityId, citationDate])
+  @@index([category])
+  @@index([severity])
+  @@index([status])
+}
+
+enum ViolationCategory {
+  RESIDENT_RIGHTS
+  QUALITY_OF_CARE
+  MEDICATION_MANAGEMENT
+  STAFFING
+  PHYSICAL_ENVIRONMENT
+  INFECTION_CONTROL
+  EMERGENCY_PREPAREDNESS
+  DIETARY_SERVICES
+  ADMINISTRATION
+  RECORDS_DOCUMENTATION
+}
+
+enum ViolationSeverity {
+  MINOR
+  MODERATE
+  MAJOR
+  CRITICAL
+}
+
+enum ViolationStatus {
+  CITED
+  UNDER_CORRECTION
+  CORRECTED
+  DISPUTED
+  APPEALED
+  WAIVED
+}
+
+// ============ INSPECTIONS ============
+
+model Inspection {
+  id                  String          @id @default(cuid())
+  facilityId          String
+  facility            Facility        @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  inspectionType      InspectionType
+  inspectionDate      DateTime
+  exitDate            DateTime?
+
+  // Results
+  overallResult       InspectionResult
+  violationCount      Int             @default(0)
+
+  // Source
+  reportUrl           String?
+  reportDocumentId    String?
+
+  violations          Violation[]
+
+  createdAt           DateTime        @default(now())
+
+  @@index([facilityId, inspectionDate])
+  @@index([inspectionType])
+}
+
+enum InspectionType {
+  INITIAL_LICENSURE
+  ANNUAL_SURVEY
+  COMPLAINT_INVESTIGATION
+  FOLLOW_UP
+  FOCUSED
+  LIFE_SAFETY
+}
+
+enum InspectionResult {
+  NO_DEFICIENCIES
+  DEFICIENCIES_CITED
+  IMMEDIATE_JEOPARDY
+  SUBSTANDARD_CARE
+}
+
+// ============ COMPLAINTS ============
+
+model Complaint {
+  id                  String          @id @default(cuid())
+  facilityId          String
+  facility            Facility        @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  // Complaint info
+  complaintNumber     String?         @unique
+  category            ComplaintCategory
+  description         String?         @db.Text
+
+  // Dates
+  receivedDate        DateTime
+  investigationDate   DateTime?
+  closedDate          DateTime?
+
+  // Outcome
+  status              ComplaintStatus
+  substantiated       Boolean?
+  resultedInCitation  Boolean         @default(false)
+
+  // Source
+  isPublicRecord      Boolean         @default(true)
+  dataSource          String
+
+  createdAt           DateTime        @default(now())
+
+  @@index([facilityId, receivedDate])
+  @@index([status])
+  @@index([category])
+}
+
+enum ComplaintCategory {
+  ABUSE_NEGLECT
+  MEDICATION_ERROR
+  STAFFING_ISSUES
+  DIETARY_CONCERNS
+  SAFETY_HAZARD
+  BILLING_FINANCIAL
+  RIGHTS_VIOLATION
+  INFECTION_CONTROL
+  OTHER
+}
+
+enum ComplaintStatus {
+  RECEIVED
+  UNDER_INVESTIGATION
+  SUBSTANTIATED
+  UNSUBSTANTIATED
+  CLOSED
+  REFERRED
+}
+
+// ============ DOCUMENTS ============
+
+model Document {
+  id              String          @id @default(cuid())
+  facilityId      String
+  facility        Facility        @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  documentType    DocumentType
+  title           String
+  description     String?
+
+  // Storage
+  s3Key           String
+  s3Bucket        String
+  fileSize        Int
+  mimeType        String
+
+  // Metadata
+  documentDate    DateTime?
+  sourceUrl       String?
+
+  // Processing
+  ocrProcessed    Boolean         @default(false)
+  ocrText         String?         @db.Text
+
+  violations      Violation[]
+
+  createdAt       DateTime        @default(now())
+
+  @@index([facilityId, documentType])
+  @@index([documentType])
+}
+
+enum DocumentType {
+  INSPECTION_REPORT
+  STATEMENT_OF_DEFICIENCIES
+  PLAN_OF_CORRECTION
+  LICENSE_APPLICATION
+  LICENSE_CERTIFICATE
+  COMPLAINT_REPORT
+  ENFORCEMENT_ACTION
+}
+
+// ============ SCORING HISTORY ============
+
+model ScoringHistory {
+  id                  String      @id @default(cuid())
+  facilityId          String
+  facility            Facility    @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  calculatedAt        DateTime    @default(now())
+
+  // Scores
+  complianceScore     Decimal     @db.Decimal(5, 2)
+  violationScore      Decimal     @db.Decimal(5, 2)
+  complaintScore      Decimal     @db.Decimal(5, 2)
+  improvementScore    Decimal     @db.Decimal(5, 2)
+
+  riskLevel           RiskLevel
+
+  // Factors
+  activeViolations    Int
+  repeatedViolations  Int
+  recentComplaints    Int
+  ownershipChanges    Int
+
+  // Algorithm version
+  algorithmVersion    String
+
+  @@index([facilityId, calculatedAt])
+}
+
+// ============ AUDIT LOG ============
+
+model AuditLog {
+  id              String          @id @default(cuid())
+
+  entityType      String
+  entityId        String
+  action          AuditAction
+
+  previousData    Json?
+  newData         Json?
+
+  performedBy     String?
+  ipAddress       String?
+
+  createdAt       DateTime        @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  SCORE_CALCULATION
+  DATA_IMPORT
+}
+
+// ============ USER & AUTH ============
+
+model User {
+  id              String          @id @default(cuid())
+  email           String          @unique
+  passwordHash    String?
+
+  role            UserRole
+
+  // Profile
+  firstName       String?
+  lastName        String?
+  organization    String?
+
+  // For facility operators
+  facilityAccess  String[]
+
+  // Auth
+  emailVerified   Boolean         @default(false)
+  lastLoginAt     DateTime?
+
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([role])
+}
+
+enum UserRole {
+  PUBLIC
+  JOURNALIST
+  RESEARCHER
+  FACILITY_OPERATOR
+  DATA_ADMIN
+  SUPER_ADMIN
+}
+
+// ============ SCRAPER STATE ============
+
+model ScraperRun {
+  id              String          @id @default(cuid())
+  scraperName     String
+  status          ScraperStatus
+
+  startedAt       DateTime        @default(now())
+  completedAt     DateTime?
+
+  facilitiesFound Int             @default(0)
+  facilitiesNew   Int             @default(0)
+  facilitiesUpdated Int           @default(0)
+  violationsFound Int             @default(0)
+  errorsCount     Int             @default(0)
+
+  errorLog        Json?
+
+  @@index([scraperName, startedAt])
+}
+
+enum ScraperStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
